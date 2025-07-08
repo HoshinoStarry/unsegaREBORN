@@ -17,7 +17,44 @@
 
 char* g_output_filename = NULL;
 
-int process_file(const char* path, bool extract_fs) {
+#ifdef _WIN32
+#include <windows.h>
+#define unlink _unlink
+#define PATH_SEPARATOR "\\"
+#else
+#include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
+#define PATH_SEPARATOR "/"
+#endif
+
+static int make_parent_dirs(const char* path) {
+    char tmp[MAX_PATH_LENGTH];
+    size_t len = strlen(path);
+    if (len >= MAX_PATH_LENGTH) return -1;
+    strcpy(tmp, path);
+
+#ifdef _WIN32
+    char sep = '\\';
+#else
+    char sep = '/';
+#endif
+    char* p = strrchr(tmp, sep);
+    if (!p) return 0;
+    *p = '\0';
+
+    if (strlen(tmp) > 0) {
+        make_parent_dirs(tmp);
+#ifdef _WIN32
+        CreateDirectoryA(tmp, NULL);
+#else
+        mkdir(tmp, 0755);
+#endif
+    }
+    return 0;
+}
+
+int process_file(const char* path, bool extract_fs, const char* output_dir) {
     uint8_t* bootid_bytes = malloc(96);
     uint8_t* read_buffer = malloc(BUFFER_SIZE);
     uint8_t* decrypted_buffer = malloc(BUFFER_SIZE);
@@ -204,8 +241,9 @@ int process_file(const char* path, bool extract_fs) {
         return 1;
     }
 
+    char file_name[MAX_PATH_LENGTH];
     if (bootid.container_type == CONTAINER_TYPE_OS) {
-        snprintf(output_filename, MAX_PATH_LENGTH, "%s_%04d%02d%02d_%s_%d.ntfs",
+        snprintf(file_name, MAX_PATH_LENGTH, "%s_%04d%02d%02d_%s_%d.ntfs",
             os_id,
             bootid.os_version.major,
             bootid.os_version.minor,
@@ -215,7 +253,7 @@ int process_file(const char* path, bool extract_fs) {
     }
     else if (bootid.container_type == CONTAINER_TYPE_APP) {
         if (bootid.sequence_number > 0) {
-            snprintf(output_filename, MAX_PATH_LENGTH, "%s_%d%02d%02d_%s_%d_%d%02d%02d.ntfs",
+            snprintf(file_name, MAX_PATH_LENGTH, "%s_%d%02d%02d_%s_%d_%d%02d%02d.ntfs",
                 game_id,
                 bootid.target_version.version.major,
                 bootid.target_version.version.minor,
@@ -227,7 +265,7 @@ int process_file(const char* path, bool extract_fs) {
                 bootid.source_version.release);
         }
         else {
-            snprintf(output_filename, MAX_PATH_LENGTH, "%s_%d%02d%02d_%s_%d.ntfs",
+            snprintf(file_name, MAX_PATH_LENGTH, "%s_%d%02d%02d_%s_%d.ntfs",
                 game_id,
                 bootid.target_version.version.major,
                 bootid.target_version.version.minor,
@@ -240,12 +278,25 @@ int process_file(const char* path, bool extract_fs) {
         char option_str[5];
         memcpy(option_str, bootid.target_version.option, 4);
         option_str[4] = '\0';
-        snprintf(output_filename, MAX_PATH_LENGTH, "%s_%s_%s_%d.exfat",
+        snprintf(file_name, MAX_PATH_LENGTH, "%s_%s_%s_%d.exfat",
             game_id,
             option_str,
             target_timestamp_str,
             bootid.sequence_number);
     }
+
+    if (output_dir && output_dir[0] != '\0') {
+#ifdef _WIN32
+        snprintf(output_filename, MAX_PATH_LENGTH, "%s\\%s", output_dir, file_name);
+#else
+        snprintf(output_filename, MAX_PATH_LENGTH, "%s/%s", output_dir, file_name);
+#endif
+    }
+    else {
+        snprintf(output_filename, MAX_PATH_LENGTH, "%s", file_name);
+    }
+
+    make_parent_dirs(output_filename);
 
     FILE* output_file = fopen(output_filename, "wb");
     if (!output_file) {
@@ -299,7 +350,8 @@ int process_file(const char* path, bool extract_fs) {
         if (read_size != chunk_size) {
             if (feof(file)) {
                 printf("\nUnexpected end of file\n");
-            } else {
+            }
+            else {
                 perror("\nread_chunk");
             }
             break;
@@ -378,42 +430,72 @@ int process_file(const char* path, bool extract_fs) {
 
 int main(int argc, char* argv[]) {
     bool extract_fs = true;
+    bool clean_intermediate = false;
     int start_index = 1;
+    char output_dir[MAX_PATH_LENGTH] = { 0 };
 
     if (argc < 2) {
-        printf("usage: unsegaREBORN [-no] <input_file1> [<input_file2> ...]\n");
-        printf("  -no   Do not extract filesystem archives after decryption\n");
+        printf("usage: unsegaREBORN [-no] [--fsout <output_dir>] [--clean] <input_file1> [<input_file2> ...]\n");
+        printf("  -no         Do not extract filesystem archives after decryption\n");
+        printf("  --fsout     Specify output directory for decrypted files\n");
+        printf("  --clean     Delete intermediate .exfat/.ntfs files after extraction (only if -no not present)\n");
         return 0;
     }
 
-    if (strcmp(argv[1], "-no") == 0) {
-        extract_fs = false;
-        start_index = 2;
-
-        if (argc < 3) {
-            printf("No input files specified\n");
-            return 1;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-no") == 0) {
+            extract_fs = false;
+            start_index = i + 1;
         }
+        else if (strcmp(argv[i], "--fsout") == 0 && i + 1 < argc) {
+            strncpy(output_dir, argv[i + 1], MAX_PATH_LENGTH - 1);
+            output_dir[MAX_PATH_LENGTH - 1] = '\0';
+            i++;
+            start_index = i + 1;
+        }
+        else if (strcmp(argv[i], "--clean") == 0) {
+            clean_intermediate = true;
+            start_index = i + 1;
+        }
+        else if (argv[i][0] != '-') {
+            start_index = i;
+            break;
+        }
+    }
+
+    if (start_index >= argc) {
+        printf("No input files specified\n");
+        return 1;
     }
 
     for (int i = start_index; i < argc; ++i) {
         const char* file_path = argv[i];
         printf("Processing file: %s\n", file_path);
 
-        if (process_file(file_path, extract_fs) == 0) {
+        if (process_file(file_path, extract_fs, output_dir) == 0) {
             if (extract_fs && g_output_filename) {
-                char output_dir[MAX_PATH_LENGTH];
-                strncpy(output_dir, g_output_filename, sizeof(output_dir) - 1);
-                output_dir[sizeof(output_dir) - 1] = '\0';
+                char output_fs_dir[MAX_PATH_LENGTH];
+                if (output_dir && output_dir[0] != '\0') {
+                    strncpy(output_fs_dir, output_dir, sizeof(output_fs_dir) - 1);
+                    output_fs_dir[sizeof(output_fs_dir) - 1] = '\0';
+                }
+                else {
+                    strncpy(output_fs_dir, g_output_filename, sizeof(output_fs_dir) - 1);
+                    output_fs_dir[sizeof(output_fs_dir) - 1] = '\0';
+                    char* ext = strrchr(output_fs_dir, '.');
+                    if (ext) *ext = '\0';
+                }
 
-                char* ext = strrchr(output_dir, '.');
-                if (ext) *ext = '\0';
+                bool extracted = false;
+                bool is_exfat = strstr(g_output_filename, ".exfat") != NULL;
+                bool is_ntfs = strstr(g_output_filename, ".ntfs") != NULL;
 
-                if (strstr(g_output_filename, ".exfat") != NULL) {
+                if (is_exfat) {
                     ExfatContext ctx;
                     if (exfat_init(&ctx, g_output_filename)) {
-                        if (exfat_extract_all(&ctx, output_dir)) {
+                        if (exfat_extract_all(&ctx, output_fs_dir)) {
                             printf("\nExFAT extraction completed successfully\n");
+                            extracted = true;
                         }
                         else {
                             printf("\nFailed to extract ExFAT archive\n");
@@ -424,20 +506,21 @@ int main(int argc, char* argv[]) {
                         printf("\nFailed to initialize ExFAT context\n");
                     }
                 }
-                else if (strstr(g_output_filename, ".ntfs") != NULL) {
+                else if (is_ntfs) {
                     NTFSContext ctx = { 0 };
-                    if (ntfs_init(&ctx, g_output_filename, output_dir)) {
+                    if (ntfs_init(&ctx, g_output_filename, output_fs_dir)) {
                         printf("\nExtracting NTFS archive...\n");
 
                         if (ntfs_extract_all(&ctx)) {
                             printf("\nNTFS extraction completed successfully\n");
+                            extracted = true;
 
                             char vhd_path[MAX_PATH_LENGTH];
                             bool found_child = false;
 
                             for (int vhd_num = 0; vhd_num < 10; vhd_num++) {
                                 snprintf(vhd_path, sizeof(vhd_path), "%s%sinternal_%d.vhd",
-                                    output_dir, PATH_SEPARATOR, vhd_num);
+                                    output_fs_dir, PATH_SEPARATOR, vhd_num);
 
                                 FILE* test = fopen(vhd_path, "rb");
                                 if (!test) continue;
@@ -449,12 +532,8 @@ int main(int argc, char* argv[]) {
                                     break;
                                 }
 
-                                char vhd_output_dir[MAX_PATH_LENGTH];
-                                snprintf(vhd_output_dir, sizeof(vhd_output_dir), "%s%scontents",
-                                    output_dir, PATH_SEPARATOR);
-
                                 NTFSContext vhd_ctx = { 0 };
-                                if (ntfs_init(&vhd_ctx, vhd_path, vhd_output_dir)) {
+                                if (ntfs_init(&vhd_ctx, vhd_path, output_fs_dir)) {
                                     printf("\nExtracting from internal VHD...\n");
                                     if (ntfs_extract_all(&vhd_ctx)) {
                                         printf("\nInternal VHD extraction completed successfully\n");
@@ -481,6 +560,15 @@ int main(int argc, char* argv[]) {
                 }
                 else {
                     printf("\nUnknown filesystem type for file %s\n", g_output_filename);
+                }
+
+                if (clean_intermediate && extracted && (is_exfat || is_ntfs)) {
+                    if (unlink(g_output_filename) == 0) {
+                        printf("Intermediate file %s deleted (--clean)\n", g_output_filename);
+                    }
+                    else {
+                        printf("Warning: failed to delete intermediate file %s\n", g_output_filename);
+                    }
                 }
 
                 free(g_output_filename);
